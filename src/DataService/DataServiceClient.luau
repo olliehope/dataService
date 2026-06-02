@@ -4,9 +4,10 @@ if RunService:IsServer() then
 	return {} :: DataServiceClient
 end
 
-local Packages = script.Parent.Parent
-local Signal = require(Packages.Signal)
-local Networker = require(Packages.Networker)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Packages = ReplicatedStorage:FindFirstChild("Packages") or script.Parent.Parent
+local Signal = require(Packages:WaitForChild("Signal"))
+local Networker = require(Packages:WaitForChild("Networker"))
 local DataServiceUtils = require(script.Parent.DataServiceUtils)
 local Data = require(script.Parent.Data)
 
@@ -21,6 +22,7 @@ local waitSignal = Signal.new()
 ]=]
 local DataServiceClient = {
 	_data = nil :: Data.Data<any>?,
+	_dataChanged = Signal.new(),
 }
 
 --[=[
@@ -96,6 +98,14 @@ end
 function DataServiceClient.get(self: DataServiceClient, path: Path?): any
 	self:waitForData()
 	return self._data:get(path)
+end
+
+function DataServiceClient.hasData(self: DataServiceClient): boolean
+	return self._data ~= nil
+end
+
+function DataServiceClient.onDataChanged(self: DataServiceClient, callback: (Data.Data<any>?) -> ()): RBXScriptConnection
+	return self._dataChanged:Connect(callback)
 end
 
 --[=[
@@ -281,15 +291,29 @@ function DataServiceClient.waitForData(self: DataServiceClient): any
 end
 
 function DataServiceClient._initData(self: DataServiceClient, data: any): ()
-	assert(self._data == nil, "DataServiceClient: Data already initialized")
+	if self._data then
+		self._data:destroy()
+	end
+
 	self._data = Data.new(data)
 	waitSignal:Fire()
+	self._dataChanged:Fire(self._data)
+end
+
+function DataServiceClient._clearData(self: DataServiceClient): ()
+	if self._data then
+		self._data:destroy()
+		self._data = nil
+	end
+
+	self._dataChanged:Fire(nil)
 end
 
 DataServiceClient[DataServiceUtils.enums.actions.set] = DataServiceClient.set
 DataServiceClient[DataServiceUtils.enums.actions.arrayInsert] = DataServiceClient.arrayInsert
 DataServiceClient[DataServiceUtils.enums.actions.arrayRemove] = DataServiceClient.arrayRemove
 DataServiceClient[DataServiceUtils.enums.actions.init] = DataServiceClient._initData
+DataServiceClient[DataServiceUtils.enums.actions.unload] = DataServiceClient._clearData
 
 export type DataServiceClient = typeof(DataServiceClient)
 

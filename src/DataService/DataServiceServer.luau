@@ -6,10 +6,16 @@ if RunService:IsClient() then
 	return {} :: DataServiceServer
 end
 
-local Packages = script.Parent.Parent
-local Signal = require(Packages.Signal)
-local Networker = require(Packages.Networker)
-local ProfileStore = if RunService:IsServer() then require(Packages.ProfileStore) else nil :: any
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Packages = ReplicatedStorage:FindFirstChild("Packages") or script.Parent.Parent
+local ServerPackages = ServerScriptService:FindFirstChild("ServerPackages")
+local Signal = require(Packages:WaitForChild("Signal"))
+local Networker = require(Packages:WaitForChild("Networker"))
+local ProfileStoreModule = if ServerPackages
+	then ServerPackages:WaitForChild("ProfileStore")
+	else Packages:WaitForChild("ProfileStore")
+local ProfileStore = if RunService:IsServer() then require(ProfileStoreModule) else nil :: any
 local Data = require(script.Parent.Data)
 local DataServiceUtils = require(script.Parent.DataServiceUtils)
 
@@ -18,6 +24,7 @@ local DEFAULT_PROFILE_STORE_INDEX = "Default"
 
 type Path = Data.Path
 type Signal<T> = Signal.Signal<T>
+type ProfileKeyResolver = (player: Player, userId: number | string) -> string
 
 type MessageData = {
 	key: string,
@@ -87,6 +94,10 @@ type DataOptions = {
 	resetData: boolean?,
 	profileStoreIndex: string?,
 	profileStoreDataPrefix: string?,
+	autoLoadPlayers: boolean?,
+	autoReleasePlayers: boolean?,
+	kickOnProfileLoadFail: boolean?,
+	profileKeyResolver: ProfileKeyResolver?,
 }
 
 type Profile = ProfileStore.Profile<any>
@@ -99,6 +110,8 @@ local DataServiceServer = {
 	_profiles = {} :: { [Player]: Profile },
 	_data = {} :: { [Player]: Data.Data<any> },
 	_waitSignals = {} :: { [Player]: Signal.Signal<any> },
+	_loadingPlayers = {} :: { [Player]: boolean },
+	_endingSessions = {} :: { [Player]: boolean },
 	_globalCallbacks = {} :: { [string]: (player: Player, { any }) -> boolean? },
 	_globalCallbackAdded = Signal.new() :: Signal.Signal<string>,
 	_removalFunctions = {} :: { (player: Player, data: any) -> () },
@@ -131,19 +144,23 @@ function DataServiceServer.init(self: DataServiceServer, options: DataOptions): 
 	self.playerStore = ProfileStore.New(options.profileStoreIndex or DEFAULT_PROFILE_STORE_INDEX, options.template)
 	self.networker = Networker.server.new("DataService", self, { self.get })
 
-	for _, player: Player in Players:GetPlayers() do
-		task.spawn(function()
+	if options.autoLoadPlayers ~= false then
+		for _, player: Player in Players:GetPlayers() do
+			task.spawn(function()
+				self:_playerAdded(player)
+			end)
+		end
+
+		Players.PlayerAdded:Connect(function(player: Player)
 			self:_playerAdded(player)
 		end)
 	end
 
-	Players.PlayerAdded:Connect(function(player: Player)
-		self:_playerAdded(player)
-	end)
-
-	Players.PlayerRemoving:Connect(function(player: Player)
-		self:_playerRemoving(player)
-	end)
+	if options.autoReleasePlayers ~= false then
+		Players.PlayerRemoving:Connect(function(player: Player)
+			self:_playerRemoving(player)
+		end)
+	end
 end
 
 local function storeCancel(player: Player)
@@ -152,6 +169,29 @@ local function storeCancel(player: Player)
 			return player.Parent ~= Players
 		end,
 	}
+end
+
+function DataServiceServer.loadPlayer(self: DataServiceServer, player: Player): (boolean, string?)
+	assert(self.playerStore, "DataServiceServer must be initialized before loading players.")
+	return self:_playerAdded(player)
+end
+
+function DataServiceServer.releasePlayer(self: DataServiceServer, player: Player): ()
+	self:_playerRemoving(player)
+end
+
+function DataServiceServer.isPlayerLoaded(self: DataServiceServer, player: Player): boolean
+	return self._profiles[player] ~= nil
+end
+
+function DataServiceServer.savePlayer(self: DataServiceServer, player: Player): boolean
+	local profile = self._profiles[player]
+	if not profile then
+		return false
+	end
+
+	profile:Save()
+	return true
 end
 
 --[=[
@@ -168,15 +208,28 @@ end
 	```
 ]=]
 function DataServiceServer.resetData(self: DataServiceServer, player: Player): ()
-	local index = self:_getProfileKey(player.UserId)
+	local index = self:_getProfileKey(player)
 	self:_playerRemoving(player)
 	self.playerStore:RemoveAsync(index)
 	player:Kick("Your data has been reset. Please rejoin.")
 end
 
-function DataServiceServer._playerAdded(self: DataServiceServer, player: Player): ()
+function DataServiceServer._playerAdded(self: DataServiceServer, player: Player): (boolean, string?)
+	if self._profiles[player] then
+		return true
+	end
+
+	if self._loadingPlayers[player] then
+		while self._loadingPlayers[player] and player:IsDescendantOf(Players) do
+			task.wait()
+		end
+
+		return self._profiles[player] ~= nil
+	end
+
+	self._loadingPlayers[player] = true
 	local userId = self.options.overridenUserId or self.options.viewedUserId or player.UserId
-	local index = self:_getProfileKey(userId)
+	local index = self:_getProfileKey(player, userId)
 
 	if self.options.resetData and not self.options.viewedUserId then
 		self.playerStore:RemoveAsync(index)
@@ -188,28 +241,52 @@ function DataServiceServer._playerAdded(self: DataServiceServer, player: Player)
 		else self.playerStore:StartSessionAsync(index, storeCancel(player))
 
 	if not profile then
-		player:Kick(`Profile load fail - Please rejoin`)
-		return
+		self._loadingPlayers[player] = nil
+		if self.options.kickOnProfileLoadFail ~= false then
+			player:Kick(`Profile load fail - Please rejoin`)
+		end
+		return false, "Profile load fail"
 	end
 
 	profile:AddUserId(userId)
 	profile:Reconcile()
 	profile.OnSessionEnd:Connect(function()
+		if self._endingSessions[player] then
+			return
+		end
+
 		self._profiles[player] = nil
+		self._loadingPlayers[player] = nil
+
+		local waitSignal = self._waitSignals[player]
+		if waitSignal then
+			waitSignal:Destroy()
+			self._waitSignals[player] = nil
+		end
+
+		local data = self._data[player]
+		if data then
+			data:destroy()
+			self._data[player] = nil
+		end
+
 		player:Kick(`Profile session end - Please rejoin`)
 	end)
 
 	if not player:IsDescendantOf(Players) then
-		player:Kick(`Profile load fail - Please rejoin`)
-		return
+		self._endingSessions[player] = true
+		profile:EndSession()
+		self._endingSessions[player] = nil
+		self._loadingPlayers[player] = nil
+		return false, "Player left before profile load completed"
 	end
 
 	self._profiles[player] = profile
 	self:_initPlayer(player, profile.Data)
 
 	if not player:IsDescendantOf(Players) then
-		player:Kick(`Profile load fail - Please rejoin`)
-		return
+		self:_playerRemoving(player)
+		return false, "Player left before profile initialization completed"
 	end
 
 	profile:MessageHandler(function(messageData: MessageData, processed: () -> ())
@@ -232,9 +309,30 @@ function DataServiceServer._playerAdded(self: DataServiceServer, player: Player)
 			waitConnection:Disconnect()
 		end)
 	end)
+
+	self._loadingPlayers[player] = nil
+	return true
 end
 
-function DataServiceServer._getProfileKey(self: DataServiceServer, userId: number | string): string
+function DataServiceServer._getProfileKey(
+	self: DataServiceServer,
+	playerOrUserId: Player | number | string,
+	userIdOverride: (number | string)?
+): string
+	local player: Player? = nil
+	local userId = userIdOverride
+
+	if typeof(playerOrUserId) == "Instance" then
+		player = playerOrUserId :: Player
+		userId = userId or self.options.overridenUserId or self.options.viewedUserId or player.UserId
+	else
+		userId = playerOrUserId :: number | string
+	end
+
+	if player and self.options.profileKeyResolver then
+		return self.options.profileKeyResolver(player, userId :: number | string)
+	end
+
 	return (self.options.profileStoreDataPrefix or DATA_PREFIX) .. tostring(userId)
 end
 
@@ -296,6 +394,7 @@ function DataServiceServer._playerRemoving(self: DataServiceServer, player: Play
 	local profile = self._profiles[player]
 
 	if not profile then
+		self._loadingPlayers[player] = nil
 		return
 	end
 
@@ -306,8 +405,13 @@ function DataServiceServer._playerRemoving(self: DataServiceServer, player: Play
 		end
 	end
 
+	self.networker:fire(player, DataServiceUtils.enums.actions.unload)
+
+	self._endingSessions[player] = true
 	profile:EndSession()
+	self._endingSessions[player] = nil
 	self._profiles[player] = nil
+	self._loadingPlayers[player] = nil
 
 	local waitSignal = self._waitSignals[player]
 	if waitSignal then
@@ -392,8 +496,7 @@ end
 	Asynchronously retrieves the profile for the given user ID using internal ProfileStore.
 ]=]
 function DataServiceServer.asyncGetProfile(self: DataServiceServer, userId: number | string): Profile?
-	local profileKey = DATA_PREFIX .. tostring(userId)
-	return self.playerStore:GetAsync(profileKey)
+	return self.playerStore:GetAsync(self:_getProfileKey(userId))
 end
 
 function DataServiceServer._initPlayer(self: DataServiceServer, player: Player, data: any): ()

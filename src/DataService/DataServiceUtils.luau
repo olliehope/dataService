@@ -6,6 +6,7 @@ DataServiceUtils.enums = {
 		set = 1,
 		arrayInsert = 2,
 		arrayRemove = 3,
+		unload = 4,
 	},
 }
 

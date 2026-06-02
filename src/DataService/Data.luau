@@ -1,5 +1,6 @@
-local Packages = script.Parent.Parent
-local Signal = require(Packages.Signal)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Packages = ReplicatedStorage:FindFirstChild("Packages") or script.Parent.Parent
+local Signal = require(Packages:WaitForChild("Signal"))
 
 local Data = {}
 Data.__index = Data
